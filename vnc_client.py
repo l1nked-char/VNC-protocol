@@ -134,6 +134,10 @@ class VNCClient:
         self.cursor_canvas_y = 0
         self.cursor_items: list[int] = []
 
+        # Модификаторные клавиши, которые сейчас зажаты (keysym-строки).
+        # Используется для сброса при потере фокуса окна.
+        self._held_modifiers: set[str] = set()
+
         self._build_ui()
 
     def _build_ui(self) -> None:
@@ -188,6 +192,9 @@ class VNCClient:
         self.canvas.bind("<Configure>", self._on_canvas_configure)
         self.root.bind("<KeyPress>", self._on_key_press)
         self.root.bind("<KeyRelease>", self._on_key_release)
+        # При потере фокуса отпускаем все зажатые модификаторы, чтобы они не
+        # «залипали» на сервере (например, если пользователь Alt+Tab-нул).
+        self.root.bind("<FocusOut>", self._on_focus_out)
 
         self._schedule_display_refresh()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -505,8 +512,24 @@ class VNCClient:
         x, y = self._map_coords(event.x, event.y)
         self.send_packet(struct.pack(">BHHh", CMD_MOUSE_SCROLL, x, y, -1))
 
+    _MODIFIER_KEYSYMS = frozenset({
+        "Shift_L", "Shift_R",
+        "Control_L", "Control_R",
+        "Alt_L", "Alt_R",
+        "Super_L", "Super_R",
+        "Meta_L", "Meta_R",
+        "Caps_Lock", "Num_Lock", "Scroll_Lock",
+    })
+
     def _send_key_event(self, keysym: str, pressed: bool) -> None:
         """Преобразует keysym и отправляет событие клавиатуры серверу."""
+        # Отслеживаем зажатые модификаторы для сброса при потере фокуса.
+        if keysym in self._MODIFIER_KEYSYMS:
+            if pressed:
+                self._held_modifiers.add(keysym)
+            else:
+                self._held_modifiers.discard(keysym)
+
         if not self.alive:
             return
         key_name = keysym_to_key_name(keysym)
@@ -515,6 +538,16 @@ class VNCClient:
             return
         payload = key_name.encode("utf-8")
         self.send_packet(struct.pack(">BBH", CMD_KEY_EVENT, int(pressed), len(payload)) + payload)
+
+    def _on_focus_out(self, _: tk.Event) -> None:
+        """При потере фокуса отпускает все зажатые модификаторы на сервере."""
+        for keysym in list(self._held_modifiers):
+            key_name = keysym_to_key_name(keysym)
+            if key_name and self.alive:
+                payload = key_name.encode("utf-8")
+                self.send_packet(struct.pack(">BBH", CMD_KEY_EVENT, 0, len(payload)) + payload)
+                log.debug("FocusOut: отпускаем модификатор %r", keysym)
+        self._held_modifiers.clear()
 
     def _on_key_press(self, event: tk.Event) -> None:
         """Отправляет событие нажатия клавиши."""

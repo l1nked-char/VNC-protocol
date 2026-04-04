@@ -85,6 +85,29 @@ KEYSYM_MAP: dict[str, str] = {
     "comma": ",",
     "period": ".",
     "slash": "/",
+
+    "exclam": "1",
+    "at": "2",
+    "numbersign": "3",
+    "dollar": "4",
+    "percent": "5",
+    "asciicircum": "6",
+    "ampersand": "7",
+    "asterisk": "8",
+    "parenleft": "9",
+    "parenright": "0",
+
+    "underscore": "-",
+    "plus": "=",
+    "braceleft": "[",
+    "braceright": "]",
+    "bar": "\\",
+    "colon": ";",
+    "quotedbl": "'",
+    "asciitilde": "`",
+    "less": ",",
+    "greater": ".",
+    "question": "/",
 }
 
 PYAUTOGUI_TO_XSYM: dict[str, str] = {
@@ -158,6 +181,14 @@ def keysym_to_key_name(keysym: str) -> str | None:
         return KEYSYM_MAP[keysym]
     if len(keysym) == 1:
         return keysym
+    # Unicode-keysym: «U» + 4..6 шестнадцатеричных цифр
+    if len(keysym) >= 5 and keysym[0] == "U":
+        try:
+            char = chr(int(keysym[1:], 16))
+            if char.isprintable():
+                return char
+        except ValueError:
+            pass
     return None
 
 
