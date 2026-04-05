@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import glob
+import hashlib
 import io
 import importlib
 import logging
@@ -29,9 +30,11 @@ from vnc_shared import (
     CMD_MOUSE_MOVE,
     CMD_MOUSE_SCROLL,
     MSG_FRAME,
+    MSG_FRAME_DELTA,
     PYAUTOGUI_TO_XSYM,
     SECURITY_NONE,
     SECURITY_VNC,
+    TILE_SIZE,
     VERSION,
     vnc_des_encrypt,
 )
@@ -437,6 +440,108 @@ def init_platform() -> None:
     log.info("Бэкенды: захват=[%s] ввод=[%s]", _GRAB_METHOD, _INPUT_BACKEND)
 
 
+class DeltaEncoder:
+    """Кодирует экран как дельту: отправляет только изменившиеся тайлы.
+
+    Алгоритм:
+      1. Делим кадр на тайлы tile_size×tile_size пикселей.
+      2. Для каждого тайла считаем MD5-хэш его сырых RGB-байт (без PIL-объекта).
+      3. Сравниваем с хэшем из предыдущего кадра; изменившиеся кодируем в JPEG.
+      4. Собираем пакет MSG_FRAME_DELTA: количество тайлов + координаты + JPEG.
+      5. Каждые FULL_FRAME_EVERY кадров принудительно отправляем полный кадр
+         (для восстановления после возможных потерь/рассинхронизации).
+    """
+
+    FULL_FRAME_EVERY = 300  # принудительный полный кадр раз в N кадров (~15 сек при 20 fps)
+
+    def __init__(self, quality: int, tile_size: int = TILE_SIZE) -> None:
+        self.quality = quality
+        self.tile_size = tile_size
+        # хэши тайлов предыдущего кадра: (tile_x, tile_y) -> md5-digest (bytes)
+        self._tile_hashes: dict[tuple[int, int], bytes] = {}
+        self._prev_size: tuple[int, int] = (0, 0)
+        self._frame_count = 0
+
+    def encode(self, image: "Image.Image") -> tuple[int, bytes]:
+        """Возвращает (msg_type, payload).
+
+        msg_type = MSG_FRAME       — полный кадр (JPEG)
+        msg_type = MSG_FRAME_DELTA — только изменившиеся тайлы
+        payload  = b""             — ничего не изменилось (не отправлять)
+        """
+        self._frame_count += 1
+        w, h = image.size
+
+        # Полный кадр: первый, при смене разрешения или раз в N кадров
+        force_full = (
+            (w, h) != self._prev_size
+            or self._frame_count == 1
+            or self._frame_count % self.FULL_FRAME_EVERY == 0
+        )
+        if force_full:
+            self._prev_size = (w, h)
+            self._tile_hashes.clear()
+            # Заполняем хэши тайлов, чтобы следующий кадр мог вычислить дельту
+            full_bytes = image.tobytes()
+            stride = w * 3
+            ts = self.tile_size
+            for ty in range(0, h, ts):
+                th = min(ts, h - ty)
+                for tx in range(0, w, ts):
+                    tw = min(ts, w - tx)
+                    rows = [
+                        full_bytes[(ty + row) * stride + tx * 3: (ty + row) * stride + (tx + tw) * 3]
+                        for row in range(th)
+                    ]
+                    self._tile_hashes[(tx, ty)] = hashlib.md5(b"".join(rows)).digest()
+            buf = io.BytesIO()
+            image.save(buf, "JPEG", quality=self.quality, optimize=False)
+            return MSG_FRAME, buf.getvalue()
+
+        ts = self.tile_size
+
+        # Получаем сырые RGB-байты всего кадра одним вызовом для быстрого хеширования
+        full_bytes = image.tobytes()  # RGB, строки без отступов
+        stride = w * 3               # байт на строку
+
+        changed: list[tuple[int, int, int, int, bytes]] = []  # (x, y, w, h, jpeg)
+
+        for ty in range(0, h, ts):
+            th = min(ts, h - ty)
+            for tx in range(0, w, ts):
+                tw = min(ts, w - tx)
+
+                # Извлекаем байты тайла построчно без создания PIL-объектов
+                tile_rows = [
+                    full_bytes[(ty + row) * stride + tx * 3: (ty + row) * stride + (tx + tw) * 3]
+                    for row in range(th)
+                ]
+                tile_hash = hashlib.md5(b"".join(tile_rows)).digest()
+
+                key = (tx, ty)
+                if self._tile_hashes.get(key) == tile_hash:
+                    continue  # тайл не изменился
+
+                self._tile_hashes[key] = tile_hash
+
+                # Кодируем изменившийся тайл в JPEG
+                tile_img = image.crop((tx, ty, tx + tw, ty + th))
+                buf = io.BytesIO()
+                tile_img.save(buf, "JPEG", quality=self.quality, optimize=False)
+                tile_img.close()
+                changed.append((tx, ty, tw, th, buf.getvalue()))
+
+        if not changed:
+            return MSG_FRAME_DELTA, b""  # пустой payload — ничего не отправлять
+
+        # Сборка пакета: num_tiles(2) + [x(2) y(2) w(2) h(2) data_len(4) data…] × N
+        parts: list[bytes] = [struct.pack(">H", len(changed))]
+        for tx, ty, tw, th, data in changed:
+            parts.append(struct.pack(">HHHHI", tx, ty, tw, th, len(data)))
+            parts.append(data)
+        return MSG_FRAME_DELTA, b"".join(parts)
+
+
 class ClientSession:
     """Обрабатывает одно клиентское подключение."""
 
@@ -545,20 +650,26 @@ class ClientSession:
         log.info("[%s] ServerInit отправлен: %s×%s", self.addr, width, height)
 
     def _frame_loop(self) -> None:
-        """Захватывает экран, кодирует кадры в JPEG и отправляет клиенту."""
+        """Захватывает экран и отправляет клиенту полные кадры или дельты."""
+        encoder = DeltaEncoder(self.quality)
         frames_sent = 0
+        skipped = 0
         fps_started_at = time.time()
 
         while self.alive:
             started_at = time.time()
-            image: Image.Image | None = None
-            buffer = io.BytesIO()
+            image: "Image.Image | None" = None
             try:
                 image = grab_screen()
-                image.save(buffer, "JPEG", quality=self.quality, optimize=False)
-                payload = buffer.getvalue()
-                self._send(struct.pack(">BI", MSG_FRAME, len(payload)) + payload)
-                frames_sent += 1
+                msg_type, payload = encoder.encode(image)
+
+                if msg_type == MSG_FRAME_DELTA and not payload:
+                    # Экран не изменился — ничего не отправляем, экономим трафик
+                    skipped += 1
+                else:
+                    self._send(struct.pack(">BI", msg_type, len(payload)) + payload)
+                    frames_sent += 1
+
             except Exception as error:
                 log.error("[%s] Ошибка отправки кадра: %s", self.addr, error)
                 self.alive = False
@@ -566,18 +677,23 @@ class ClientSession:
             finally:
                 if image is not None:
                     image.close()
-                buffer.close()
 
             elapsed = time.time() - fps_started_at
             if elapsed >= 5:
                 fps = frames_sent / elapsed
-                log.info("[%s] Реальный FPS: %.1f", self.addr, fps)
+                log.info(
+                    "[%s] FPS: %.1f  отправлено=%d  пропущено (без изменений)=%d",
+                    self.addr, fps, frames_sent, skipped,
+                )
                 frames_sent = 0
+                skipped = 0
                 fps_started_at = time.time()
 
             remaining = self.interval - (time.time() - started_at)
             if remaining > 0:
                 time.sleep(remaining)
+
+        _close_thread_mss()
 
         _close_thread_mss()
 
@@ -671,13 +787,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
-
-
-
-
-
-
-
-
-

@@ -23,6 +23,7 @@ from vnc_shared import (
     CMD_MOUSE_MOVE,
     CMD_MOUSE_SCROLL,
     MSG_FRAME,
+    MSG_FRAME_DELTA,
     MOUSE_BUTTON_MAP,
     SECURITY_NONE,
     SECURITY_VNC,
@@ -133,6 +134,12 @@ class VNCClient:
         self.cursor_canvas_x = 0
         self.cursor_canvas_y = 0
         self.cursor_items: list[int] = []
+
+        # Локальный framebuffer: собирает полное изображение из дельт.
+        # Защищён блокировкой, т.к. пишется потоком-приёмником и читается
+        # при формировании кадра для отображения.
+        self._framebuffer: Image.Image | None = None
+        self._fb_lock = threading.Lock()
 
         # Модификаторные клавиши, которые сейчас зажаты (keysym-строки).
         # Используется для сброса при потере фокуса окна.
@@ -330,27 +337,31 @@ class VNCClient:
         return buffer
 
     def _frame_receiver(self) -> None:
-        """Принимает JPEG-кадры в фоновом потоке и кладёт их в очередь."""
+        """Принимает кадры (полные и дельты) в фоновом потоке."""
         while self.alive:
             try:
                 started_at = time.perf_counter()
                 msg_type, payload_size = struct.unpack(">BI", self._recv_exact(5))
-                payload = self._recv_exact(payload_size)
+                payload = self._recv_exact(payload_size) if payload_size else b""
                 self.last_frame_ms = (time.perf_counter() - started_at) * 1000
 
-                if msg_type != MSG_FRAME:
-                    continue
+                if msg_type == MSG_FRAME:
+                    # Полный кадр: декодируем и обновляем framebuffer целиком
+                    image = Image.open(io.BytesIO(payload))
+                    image.load()
+                    with self._fb_lock:
+                        if self._framebuffer is not None:
+                            self._framebuffer.close()
+                        self._framebuffer = image.copy()
+                    self._enqueue_frame(image)
 
-                image = Image.open(io.BytesIO(payload))
-                image.load()
+                elif msg_type == MSG_FRAME_DELTA:
+                    if payload:
+                        self._apply_delta(payload)
 
-                if self.frame_queue.full():
-                    try:
-                        dropped = self.frame_queue.get_nowait()
-                        dropped.close()
-                    except queue.Empty:
-                        pass
-                self.frame_queue.put_nowait(image)
+                else:
+                    log.warning("Неизвестный тип сообщения: %s", msg_type)
+
             except ConnectionError as error:
                 log.info("Соединение прервано: %s", error)
                 self.alive = False
@@ -360,6 +371,58 @@ class VNCClient:
                 if self.alive:
                     log.error("Ошибка приёма кадра: %s", error)
                 break
+
+    def _enqueue_frame(self, image: Image.Image) -> None:
+        """Кладёт готовый кадр в очередь отображения, вытесняя устаревший."""
+        if self.frame_queue.full():
+            try:
+                dropped = self.frame_queue.get_nowait()
+                dropped.close()
+            except queue.Empty:
+                pass
+        self.frame_queue.put_nowait(image)
+
+    def _apply_delta(self, payload: bytes) -> None:
+        """Применяет дельта-пакет к локальному framebuffer.
+
+        Формат payload:
+          num_tiles (2 байта, uint16)
+          для каждого тайла:
+            x (2), y (2), w (2), h (2), data_len (4), jpeg_data (data_len байт)
+        """
+        offset = 0
+        num_tiles = struct.unpack_from(">H", payload, offset)[0]
+        offset += 2
+
+        # Декодируем все тайлы до взятия блокировки — минимизируем время замка
+        decoded: list[tuple[int, int, Image.Image]] = []
+        try:
+            for _ in range(num_tiles):
+                tx, ty, tw, th, data_len = struct.unpack_from(">HHHHI", payload, offset)
+                offset += 12
+                tile = Image.open(io.BytesIO(payload[offset: offset + data_len]))
+                tile.load()
+                offset += data_len
+                decoded.append((tx, ty, tile))
+        except Exception as error:
+            log.error("Ошибка декодирования тайла: %s", error)
+            for _, _, t in decoded:
+                t.close()
+            return
+
+        with self._fb_lock:
+            if self._framebuffer is None:
+                for _, _, t in decoded:
+                    t.close()
+                return
+            for tx, ty, tile in decoded:
+                self._framebuffer.paste(tile, (tx, ty))
+            frame_copy = self._framebuffer.copy()
+
+        for _, _, tile in decoded:
+            tile.close()
+
+        self._enqueue_frame(frame_copy)
 
     def _schedule_display_refresh(self) -> None:
         """Планирует очередное обновление экрана клиента."""
@@ -540,7 +603,11 @@ class VNCClient:
         self.send_packet(struct.pack(">BBH", CMD_KEY_EVENT, int(pressed), len(payload)) + payload)
 
     def _on_focus_out(self, _: tk.Event) -> None:
-        """При потере фокуса отпускает все зажатые модификаторы на сервере."""
+        """При потере фокуса отпускает все зажатые модификаторы на сервере.
+
+        Это предотвращает «залипание» Shift, Ctrl, Alt и т.п. на сервере,
+        если пользователь переключился в другое окно, удерживая модификатор.
+        """
         for keysym in list(self._held_modifiers):
             key_name = keysym_to_key_name(keysym)
             if key_name and self.alive:
