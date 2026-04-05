@@ -134,15 +134,8 @@ class VNCClient:
         self.cursor_canvas_x = 0
         self.cursor_canvas_y = 0
         self.cursor_items: list[int] = []
-
-        # Локальный framebuffer: собирает полное изображение из дельт.
-        # Защищён блокировкой, т.к. пишется потоком-приёмником и читается
-        # при формировании кадра для отображения.
         self._framebuffer: Image.Image | None = None
         self._fb_lock = threading.Lock()
-
-        # Модификаторные клавиши, которые сейчас зажаты (keysym-строки).
-        # Используется для сброса при потере фокуса окна.
         self._held_modifiers: set[str] = set()
 
         self._build_ui()
@@ -199,8 +192,6 @@ class VNCClient:
         self.canvas.bind("<Configure>", self._on_canvas_configure)
         self.root.bind("<KeyPress>", self._on_key_press)
         self.root.bind("<KeyRelease>", self._on_key_release)
-        # При потере фокуса отпускаем все зажатые модификаторы, чтобы они не
-        # «залипали» на сервере (например, если пользователь Alt+Tab-нул).
         self.root.bind("<FocusOut>", self._on_focus_out)
 
         self._schedule_display_refresh()
@@ -346,7 +337,6 @@ class VNCClient:
                 self.last_frame_ms = (time.perf_counter() - started_at) * 1000
 
                 if msg_type == MSG_FRAME:
-                    # Полный кадр: декодируем и обновляем framebuffer целиком
                     image = Image.open(io.BytesIO(payload))
                     image.load()
                     with self._fb_lock:
@@ -394,7 +384,6 @@ class VNCClient:
         num_tiles = struct.unpack_from(">H", payload, offset)[0]
         offset += 2
 
-        # Декодируем все тайлы до взятия блокировки — минимизируем время замка
         decoded: list[tuple[int, int, Image.Image]] = []
         try:
             for _ in range(num_tiles):

@@ -4,10 +4,10 @@ VERSION = b"RFB 003.008\n"
 SECURITY_NONE = 1
 SECURITY_VNC = 2
 
-MSG_FRAME = 0        # полный JPEG-кадр
+MSG_FRAME = 0
 MSG_FRAME_DELTA = 1  # только изменившиеся тайлы
 
-TILE_SIZE = 64       # размер тайла в пикселях (степень двойки)
+TILE_SIZE = 64       # размер тайла в пикселях
 
 CMD_MOUSE_MOVE = 1
 CMD_MOUSE_CLICK = 2

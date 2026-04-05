@@ -500,9 +500,8 @@ class DeltaEncoder:
 
         ts = self.tile_size
 
-        # Получаем сырые RGB-байты всего кадра одним вызовом для быстрого хеширования
-        full_bytes = image.tobytes()  # RGB, строки без отступов
-        stride = w * 3               # байт на строку
+        full_bytes = image.tobytes()
+        stride = w * 3
 
         changed: list[tuple[int, int, int, int, bytes]] = []  # (x, y, w, h, jpeg)
 
@@ -511,7 +510,6 @@ class DeltaEncoder:
             for tx in range(0, w, ts):
                 tw = min(ts, w - tx)
 
-                # Извлекаем байты тайла построчно без создания PIL-объектов
                 tile_rows = [
                     full_bytes[(ty + row) * stride + tx * 3: (ty + row) * stride + (tx + tw) * 3]
                     for row in range(th)
@@ -520,11 +518,10 @@ class DeltaEncoder:
 
                 key = (tx, ty)
                 if self._tile_hashes.get(key) == tile_hash:
-                    continue  # тайл не изменился
+                    continue
 
                 self._tile_hashes[key] = tile_hash
 
-                # Кодируем изменившийся тайл в JPEG
                 tile_img = image.crop((tx, ty, tx + tw, ty + th))
                 buf = io.BytesIO()
                 tile_img.save(buf, "JPEG", quality=self.quality, optimize=False)
@@ -532,7 +529,7 @@ class DeltaEncoder:
                 changed.append((tx, ty, tw, th, buf.getvalue()))
 
         if not changed:
-            return MSG_FRAME_DELTA, b""  # пустой payload — ничего не отправлять
+            return MSG_FRAME_DELTA, b""
 
         # Сборка пакета: num_tiles(2) + [x(2) y(2) w(2) h(2) data_len(4) data…] × N
         parts: list[bytes] = [struct.pack(">H", len(changed))]
@@ -664,7 +661,6 @@ class ClientSession:
                 msg_type, payload = encoder.encode(image)
 
                 if msg_type == MSG_FRAME_DELTA and not payload:
-                    # Экран не изменился — ничего не отправляем, экономим трафик
                     skipped += 1
                 else:
                     self._send(struct.pack(">BI", msg_type, len(payload)) + payload)
